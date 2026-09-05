@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>WordHeat — Semantic Word Game</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <main id="app" class="app-shell">
+    <section id="home" class="screen active" aria-labelledby="home-title">
+      <div class="home-mark">WH</div>
+      <p class="eyebrow">A semantic word game</p>
+      <h1 id="home-title">How close<br>can you get?</h1>
+      <p class="subcopy">The word is hidden. Your guesses reveal how close your thinking is.</p>
+      <button id="playBtn" class="primary-btn" type="button">Play game <span>→</span></button>
+      <p class="hint">No clues. Just your intuition.</p>
+    </section>
+
+    <section id="game" class="screen" aria-labelledby="game-title">
+      <header class="game-header">
+        <button id="quitBtn" class="text-btn" type="button">End game</button>
+        <div class="timer" aria-label="Elapsed time"><span id="timer">00:00</span></div>
+        <div class="attempt-count"><span id="attempts">0</span> guesses</div>
+      </header>
+
+      <div class="game-layout">
+        <div class="left-column">
+          <section class="guess-panel" aria-labelledby="game-title">
+            <p class="eyebrow">Your guess</p>
+            <h2 id="game-title">Find the hidden word</h2>
+
+            <form id="guessForm" class="guess-form" aria-label="Submit a word guess">
+              <label for="guessInput" class="sr-only">Your guess</label>
+              <input id="guessInput" autocomplete="off" spellcheck="false" placeholder="Type a word…" maxlength="40" required>
+              <div class="guess-actions">
+              <button class="primary-btn" type="submit" aria-label="Submit guess">Guess <span>↵</span></button>
+              <button id="hintBtn" class="secondary-btn" type="button">Hint <span>?</span></button>
+            </div>
+            </form>
+
+            <div class="current-score" aria-live="polite">
+              <div>
+                <div class="heat-number" id="heatNumber">—</div>
+                <div class="heat-label" id="heatLabel">Make your first guess</div>
+              </div>
+              <div class="meter" aria-hidden="true"><div id="meterFill"></div></div>
+            </div>
+
+            <p id="error" class="error" role="alert"></p>
+            <div class="hint-area" aria-live="polite">
+              <div class="section-heading">
+                <span>Hints</span>
+                <span id="hintCount">0 / 4</span>
+              </div>
+              <ol id="hintList" class="hint-list">
+                <li class="hint-empty">Use a hint when you get stuck.</li>
+              </ol>
+            </div>
+          </section>
+
+          <section class="nearest-panel" aria-labelledby="nearest-title">
+            <div class="section-heading">
+              <span id="nearest-title">Nearest words</span>
+              <span id="nearestContext">Waiting for a guess</span>
+            </div>
+            <ol id="nearestWords" class="nearest-list" aria-live="polite"></ol>
+          </section>
+        </div>
+
+        <aside class="history-panel" aria-labelledby="history-title">
+          <div class="section-heading">
+            <span id="history-title">Guess history</span>
+            <span id="bestLabel">Best —</span>
+          </div>
+          <ol id="history" class="history" aria-live="polite"></ol>
+        </aside>
+      </div>
+    </section>
+
+    <section id="result" class="screen" aria-labelledby="result-title">
+      <p class="eyebrow" id="resultEyebrow">Game complete</p>
+      <h2 id="result-title">You found it.</h2>
+      <div class="answer" id="answer">COW</div>
+
+      <div class="stats">
+        <div><strong id="finalTime">00:00</strong><span>time</span></div>
+        <div><strong id="finalAttempts">0</strong><span>guesses</span></div>
+        <div><strong id="finalBest">0%</strong><span>best</span></div>
+      </div>
+
+      <div class="trail-wrap">
+        <div class="history-heading"><span>Your semantic trail</span></div>
+        <div id="trail" class="trail"></div>
+      </div>
+
+      <button id="replayBtn" class="primary-btn" type="button">Play again <span>↗</span></button>
+    </section>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>

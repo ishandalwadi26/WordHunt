@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# GloVe source file - VERY LARGE
+backend/glove.840B.300d.txt
+
+# Local environments
+.venv/
+venv/
+env/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Vercel
+.vercel/
