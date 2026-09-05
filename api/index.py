@@ -1,5 +1,7 @@
+
 from pathlib import Path
 import json
+import os
 import random
 import uuid
 
@@ -9,12 +11,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from upstash_redis import Redis
 
+
 HERE = Path(__file__).resolve().parent
 DATA = HERE.parent / "data"
 VFILE = DATA / "vectors.npy"
 IFILE = DATA / "word_index.json"
 
-app = FastAPI(title="WordHeat API", version="6.0")
+
+app = FastAPI(title="WordHeat API", version="6.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -24,13 +28,57 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 # ============================================================
 # REDIS
 # ============================================================
 
-redis = Redis.from_env()
+def create_redis():
+    # Standard Upstash names
+    url = os.getenv("UPSTASH_REDIS_REST_URL")
+    token = os.getenv("UPSTASH_REDIS_REST_TOKEN")
 
-GAME_TTL = 60 * 60 * 2  # 2 hours
+    # Vercel Upstash integration names
+    if not url:
+        url = os.getenv("KV_REST_API_URL")
+
+    if not token:
+        token = os.getenv("KV_REST_API_TOKEN")
+
+    # Additional names used by some Upstash/Vercel integrations
+    if not url:
+        url = os.getenv("KV_URL")
+
+    if not token:
+        token = os.getenv("REDIS_TOKEN")
+
+    if not url:
+        url = os.getenv("REDIS_URL")
+
+    if not url or not token:
+        raise RuntimeError(
+            "Redis environment variables were not found. "
+            "Expected UPSTASH_REDIS_REST_URL / "
+            "UPSTASH_REDIS_REST_TOKEN or KV_REST_API_URL / "
+            "KV_REST_API_TOKEN."
+        )
+
+    return Redis(
+        url=url,
+        token=token,
+    )
+
+
+redis = None
+redis_error = None
+
+try:
+    redis = create_redis()
+except Exception as exc:
+    redis_error = f"{type(exc).__name__}: {exc}"
+
+
+GAME_TTL = 60 * 60 * 2
 
 
 def game_key(game_id):
@@ -38,6 +86,12 @@ def game_key(game_id):
 
 
 def save_game(game_id, game):
+    if redis is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Redis is not connected."
+        )
+
     redis.set(
         game_key(game_id),
         json.dumps(game),
@@ -46,7 +100,15 @@ def save_game(game_id, game):
 
 
 def load_game(game_id):
-    data = redis.get(game_key(game_id))
+    if redis is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Redis is not connected."
+        )
+
+    data = redis.get(
+        game_key(game_id)
+    )
 
     if data is None:
         return None
@@ -73,7 +135,10 @@ startup_error = None
 
 @app.on_event("startup")
 def load_vectors():
-    global vectors, word_to_id, id_to_word, startup_error
+    global vectors
+    global word_to_id
+    global id_to_word
+    global startup_error
 
     try:
         print(f"Loading vectors from: {VFILE}")
@@ -81,12 +146,16 @@ def load_vectors():
         print(f"Index file exists: {IFILE.exists()}")
 
         if not VFILE.exists():
-            startup_error = f"vectors.npy not found: {VFILE}"
+            startup_error = (
+                f"vectors.npy not found: {VFILE}"
+            )
             print(startup_error)
             return
 
         if not IFILE.exists():
-            startup_error = f"word_index.json not found: {IFILE}"
+            startup_error = (
+                f"word_index.json not found: {IFILE}"
+            )
             print(startup_error)
             return
 
@@ -95,8 +164,12 @@ def load_vectors():
             mmap_mode="r"
         )
 
-        print(f"Vectors shape: {vectors.shape}")
-        print(f"Vectors dtype: {vectors.dtype}")
+        print(
+            f"Vectors shape: {vectors.shape}"
+        )
+        print(
+            f"Vectors dtype: {vectors.dtype}"
+        )
 
         word_to_id = json.loads(
             IFILE.read_text(
@@ -104,13 +177,15 @@ def load_vectors():
             )
         )
 
-        id_to_word = [""] * len(word_to_id)
+        id_to_word = [
+            ""
+        ] * len(word_to_id)
 
         for word, idx in word_to_id.items():
             id_to_word[int(idx)] = word
 
         print(
-            f"WORDHEAT BACKEND 6.0: "
+            f"WORDHEAT BACKEND 6.1: "
             f"loaded {len(id_to_word):,} vectors."
         )
 
@@ -118,6 +193,7 @@ def load_vectors():
         startup_error = (
             f"{type(exc).__name__}: {exc}"
         )
+
         vectors = None
         word_to_id = {}
         id_to_word = []
@@ -166,6 +242,21 @@ def require_model():
         )
 
 
+def require_redis():
+    if redis is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Redis is not connected."
+                + (
+                    f" {redis_error}"
+                    if redis_error
+                    else ""
+                )
+            )
+        )
+
+
 def clean(word):
     return word.strip().lower()
 
@@ -173,7 +264,7 @@ def clean(word):
 def get_game(game_id):
     game = load_game(game_id)
 
-    if not game:
+    if game is None:
         raise HTTPException(
             status_code=404,
             detail="Game not found."
@@ -187,14 +278,6 @@ def get_game(game_id):
 # ============================================================
 
 def hidden_similarities(game):
-    """
-    Calculate semantic similarity of every vocabulary word
-    to the hidden word.
-
-    vectors.npy contains normalized vectors, so matrix
-    multiplication gives cosine similarity.
-    """
-
     hidden_id = int(
         game["hidden_id"]
     )
@@ -214,10 +297,6 @@ def hidden_similarities(game):
 
 
 def rank_score(similarities, word_id):
-    """
-    WordHeat score based on semantic rank.
-    """
-
     value = float(
         similarities[word_id]
     )
@@ -251,10 +330,6 @@ def rank_score(similarities, word_id):
 
 
 def rank_score_fast(similarities, word_id):
-    """
-    Faster rank score using counting instead of sorting.
-    """
-
     value = float(
         similarities[word_id]
     )
@@ -294,8 +369,7 @@ def normal_cosine_score(cosine):
                     1.0,
                     float(cosine)
                 )
-            )
-            * 100
+            ) * 100
         )
     )
 
@@ -357,17 +431,6 @@ def nearest(
 # ============================================================
 
 def choose_hint(game):
-    """
-    Select a real semantic hint.
-
-    Maximum 4 hints.
-
-    Target progression:
-        20 -> 45 -> 70 -> 96
-
-    The returned score is the real WordHeat score.
-    """
-
     hint_number = (
         len(game["hints"]) + 1
     )
@@ -375,7 +438,9 @@ def choose_hint(game):
     if hint_number > 4:
         raise HTTPException(
             status_code=400,
-            detail="All 4 hints have already been used."
+            detail=(
+                "All 4 hints have already been used."
+            )
         )
 
     similarities = hidden_similarities(
@@ -386,7 +451,6 @@ def choose_hint(game):
         game["hidden_id"]
     )
 
-    # Words already guessed or hinted.
     excluded_words = set(
         game.get(
             "guessed_words",
@@ -431,7 +495,6 @@ def choose_hint(game):
             )
         )
 
-    # Current best score.
     best_guess = max(
         [
             item["score"]
@@ -458,7 +521,6 @@ def choose_hint(game):
     else:
         if hint_number == 4:
             target_score = 96
-
         else:
             start = best_guess + 5
 
@@ -473,7 +535,6 @@ def choose_hint(game):
                 * progress
             )
 
-    # Hint should beat current best.
     target_score = max(
         target_score,
         best_guess + 1
@@ -592,40 +653,44 @@ def choose_hint(game):
 @app.get("/api/health")
 def health():
     redis_connected = False
-    redis_error = None
+    redis_health_error = redis_error
 
-    try:
-        redis.set(
-            "wordheat:health",
-            "ok",
-            ex=60
-        )
-
-        value = redis.get(
-            "wordheat:health"
-        )
-
-        if isinstance(value, bytes):
-            value = value.decode(
-                "utf-8"
+    if redis is not None:
+        try:
+            redis.set(
+                "wordheat:health",
+                "ok",
+                ex=60
             )
 
-        redis_connected = (
-            value == "ok"
-        )
+            value = redis.get(
+                "wordheat:health"
+            )
 
-    except Exception as exc:
-        redis_error = (
-            f"{type(exc).__name__}: {exc}"
-        )
+            if isinstance(value, bytes):
+                value = value.decode(
+                    "utf-8"
+                )
+
+            redis_connected = (
+                value == "ok"
+            )
+
+        except Exception as exc:
+            redis_health_error = (
+                f"{type(exc).__name__}: {exc}"
+            )
 
     return {
         "status": (
             "ok"
-            if vectors is not None
+            if (
+                vectors is not None
+                and redis_connected
+            )
             else "error"
         ),
-        "version": "6.0",
+        "version": "6.1",
         "vectors_loaded": (
             vectors is not None
         ),
@@ -641,7 +706,7 @@ def health():
             else 0
         ),
         "redis_connected": redis_connected,
-        "redis_error": redis_error,
+        "redis_error": redis_health_error,
         "endpoints": [
             "/api/game/start",
             "/api/game/guess",
@@ -658,6 +723,7 @@ def health():
 @app.post("/api/game/start")
 def start(req: StartRequest):
     require_model()
+    require_redis()
 
     if not id_to_word:
         raise HTTPException(
@@ -704,7 +770,7 @@ def start(req: StartRequest):
 
     return {
         "game_id": gid,
-        "backend_version": "6.0"
+        "backend_version": "6.1"
     }
 
 
@@ -715,6 +781,7 @@ def start(req: StartRequest):
 @app.post("/api/game/guess")
 def guess(req: GuessRequest):
     require_model()
+    require_redis()
 
     game = get_game(
         req.game_id
@@ -830,6 +897,7 @@ def guess(req: GuessRequest):
 @app.post("/api/game/hint")
 def hint(req: HintRequest):
     require_model()
+    require_redis()
 
     game = get_game(
         req.game_id
@@ -887,6 +955,8 @@ def hint(req: HintRequest):
 
 @app.post("/api/game/end")
 def end_game(req: EndRequest):
+    require_redis()
+
     game = get_game(
         req.game_id
     )
@@ -911,6 +981,8 @@ def end_game(req: EndRequest):
 
 @app.get("/api/game/{game_id}")
 def game_state(game_id: str):
+    require_redis()
+
     game = get_game(
         game_id
     )
@@ -932,3 +1004,4 @@ def game_state(game_id: str):
             False
         )
     }
+
