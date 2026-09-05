@@ -29,23 +29,50 @@ id_to_word = []
 games = {}
 
 
+startup_error = None
+
+
 @app.on_event("startup")
 def load_vectors():
-    global vectors, word_to_id, id_to_word
+    global vectors, word_to_id, id_to_word, startup_error
 
-    if not VFILE.exists() or not IFILE.exists():
-        print("Vectors not prepared. Run: python backend/prepare_vectors.py")
-        return
+    try:
+        print(f"Loading vectors from: {VFILE}")
+        print(f"Vector file exists: {VFILE.exists()}")
+        print(f"Index file exists: {IFILE.exists()}")
 
-    vectors = np.load(VFILE, mmap_mode="r")
-    word_to_id = json.loads(IFILE.read_text(encoding="utf-8"))
+        if not VFILE.exists():
+            startup_error = f"vectors.npy not found: {VFILE}"
+            print(startup_error)
+            return
 
-    id_to_word = [""] * len(word_to_id)
-    for word, idx in word_to_id.items():
-        id_to_word[int(idx)] = word
+        if not IFILE.exists():
+            startup_error = f"word_index.json not found: {IFILE}"
+            print(startup_error)
+            return
 
-    print(f"WORDHEAT BACKEND 5.1: loaded {len(id_to_word):,} vectors.")
+        vectors = np.load(VFILE, mmap_mode="r")
+        print(f"Vectors shape: {vectors.shape}")
+        print(f"Vectors dtype: {vectors.dtype}")
 
+        word_to_id = json.loads(
+            IFILE.read_text(encoding="utf-8")
+        )
+
+        id_to_word = [""] * len(word_to_id)
+
+        for word, idx in word_to_id.items():
+            id_to_word[int(idx)] = word
+
+        print(
+            f"WORDHEAT BACKEND 5.1: "
+            f"loaded {len(id_to_word):,} vectors."
+        )
+
+    except Exception as exc:
+        startup_error = f"{type(exc).__name__}: {exc}"
+        vectors = None
+        print(f"STARTUP ERROR: {startup_error}")
 
 class StartRequest(BaseModel):
     hidden_word: str | None = None
@@ -308,14 +335,21 @@ def choose_hint(game):
 @app.get("/api/health")
 def health():
     return {
-        "status": "ok",
+        "status": "ok" if vectors is not None else "error",
         "version": "5.1",
         "vectors_loaded": vectors is not None,
+        "startup_error": startup_error,
+        "vector_file_exists": VFILE.exists(),
+        "index_file_exists": IFILE.exists(),
         "vocabulary_size": len(word_to_id),
         "dimensions": int(vectors.shape[1]) if vectors is not None else 0,
-        "endpoints": ["/api/game/start", "/api/game/guess", "/api/game/hint", "/api/game/end"],
+        "endpoints": [
+            "/api/game/start",
+            "/api/game/guess",
+            "/api/game/hint",
+            "/api/game/end",
+        ],
     }
-
 
 @app.post("/api/game/start")
 def start(req: StartRequest):
