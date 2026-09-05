@@ -7,13 +7,14 @@ import numpy as np
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from upstash_redis import Redis
 
 HERE = Path(__file__).resolve().parent
 DATA = HERE.parent / "data"
 VFILE = DATA / "vectors.npy"
 IFILE = DATA / "word_index.json"
 
-app = FastAPI(title="WordHeat API", version="5.1")
+app = FastAPI(title="WordHeat API", version="6.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -23,11 +24,49 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ============================================================
+# REDIS
+# ============================================================
+
+redis = Redis.from_env()
+
+GAME_TTL = 60 * 60 * 2  # 2 hours
+
+
+def game_key(game_id):
+    return f"wordheat:game:{game_id}"
+
+
+def save_game(game_id, game):
+    redis.set(
+        game_key(game_id),
+        json.dumps(game),
+        ex=GAME_TTL,
+    )
+
+
+def load_game(game_id):
+    data = redis.get(game_key(game_id))
+
+    if data is None:
+        return None
+
+    if isinstance(data, bytes):
+        data = data.decode("utf-8")
+
+    if isinstance(data, str):
+        return json.loads(data)
+
+    return data
+
+
+# ============================================================
+# MODEL DATA
+# ============================================================
+
 vectors = None
 word_to_id = {}
 id_to_word = []
-games = {}
-
 
 startup_error = None
 
@@ -51,12 +90,18 @@ def load_vectors():
             print(startup_error)
             return
 
-        vectors = np.load(VFILE, mmap_mode="r")
+        vectors = np.load(
+            VFILE,
+            mmap_mode="r"
+        )
+
         print(f"Vectors shape: {vectors.shape}")
         print(f"Vectors dtype: {vectors.dtype}")
 
         word_to_id = json.loads(
-            IFILE.read_text(encoding="utf-8")
+            IFILE.read_text(
+                encoding="utf-8"
+            )
         )
 
         id_to_word = [""] * len(word_to_id)
@@ -65,14 +110,26 @@ def load_vectors():
             id_to_word[int(idx)] = word
 
         print(
-            f"WORDHEAT BACKEND 5.1: "
+            f"WORDHEAT BACKEND 6.0: "
             f"loaded {len(id_to_word):,} vectors."
         )
 
     except Exception as exc:
-        startup_error = f"{type(exc).__name__}: {exc}"
+        startup_error = (
+            f"{type(exc).__name__}: {exc}"
+        )
         vectors = None
-        print(f"STARTUP ERROR: {startup_error}")
+        word_to_id = {}
+        id_to_word = []
+
+        print(
+            f"STARTUP ERROR: {startup_error}"
+        )
+
+
+# ============================================================
+# REQUEST MODELS
+# ============================================================
 
 class StartRequest(BaseModel):
     hidden_word: str | None = None
@@ -80,7 +137,10 @@ class StartRequest(BaseModel):
 
 class GuessRequest(BaseModel):
     game_id: str
-    word: str = Field(min_length=1, max_length=80)
+    word: str = Field(
+        min_length=1,
+        max_length=80
+    )
 
 
 class HintRequest(BaseModel):
@@ -91,11 +151,18 @@ class EndRequest(BaseModel):
     game_id: str
 
 
+# ============================================================
+# HELPERS
+# ============================================================
+
 def require_model():
     if vectors is None:
         raise HTTPException(
             status_code=503,
-            detail="Vectors are not prepared. Run prepare_vectors.py first."
+            detail=(
+                "Vectors are not prepared. "
+                "Run prepare_vectors.py first."
+            )
         )
 
 
@@ -103,25 +170,44 @@ def clean(word):
     return word.strip().lower()
 
 
+def get_game(game_id):
+    game = load_game(game_id)
+
+    if not game:
+        raise HTTPException(
+            status_code=404,
+            detail="Game not found."
+        )
+
+    return game
+
+
+# ============================================================
+# SIMILARITY
+# ============================================================
+
 def hidden_similarities(game):
     """
-    Calculate semantic similarity of every vocabulary word to the hidden word.
+    Calculate semantic similarity of every vocabulary word
+    to the hidden word.
 
-    Because vectors.npy was normalized during preprocessing, matrix multiplication
-    is cosine similarity.
-
-    The returned array is used for BOTH:
-      - normal guess scores
-      - hint scores
-
-    Therefore a hint can never claim a score that the same word gets when guessed.
+    vectors.npy contains normalized vectors, so matrix
+    multiplication gives cosine similarity.
     """
-    hidden_id = game["hidden_id"]
-    hidden_vector = np.asarray(vectors[hidden_id], dtype=np.float32)
 
-    similarities = np.asarray(vectors @ hidden_vector)
+    hidden_id = int(
+        game["hidden_id"]
+    )
 
-    # The answer itself is never exposed as a hint.
+    hidden_vector = np.asarray(
+        vectors[hidden_id],
+        dtype=np.float32
+    )
+
+    similarities = np.asarray(
+        vectors @ hidden_vector
+    )
+
     similarities[hidden_id] = -np.inf
 
     return similarities
@@ -129,184 +215,341 @@ def hidden_similarities(game):
 
 def rank_score(similarities, word_id):
     """
-    WordHeat score is based on semantic rank against the hidden word.
-
-    0..100 means approximately how high this word ranks among the entire
-    prepared vocabulary for the current hidden word.
-
-    This fixes the old unfair behavior where hints used artificial percentages
-    that did not match the score received when the player guessed that word.
+    WordHeat score based on semantic rank.
     """
-    value = float(similarities[word_id])
+
+    value = float(
+        similarities[word_id]
+    )
 
     if not np.isfinite(value):
         return 100
 
-    valid = similarities[np.isfinite(similarities)]
+    valid = similarities[
+        np.isfinite(similarities)
+    ]
 
-    # Percentile rank: how much of the vocabulary this word is closer than.
-    rank = np.searchsorted(np.sort(valid), value, side="right") - 1
-    denominator = max(1, len(valid) - 1)
+    rank = (
+        np.searchsorted(
+            np.sort(valid),
+            value,
+            side="right"
+        )
+        - 1
+    )
 
-    return int(round((rank / denominator) * 100))
+    denominator = max(
+        1,
+        len(valid) - 1
+    )
+
+    return int(
+        round(
+            (rank / denominator) * 100
+        )
+    )
 
 
 def rank_score_fast(similarities, word_id):
     """
-    Fast equivalent of rank_score().
-
-    Uses np.count_nonzero instead of sorting all 100K values. This is used
-    during hint generation so a hint can be selected much faster.
+    Faster rank score using counting instead of sorting.
     """
-    value = float(similarities[word_id])
+
+    value = float(
+        similarities[word_id]
+    )
 
     if not np.isfinite(value):
         return 100
 
-    valid = similarities[np.isfinite(similarities)]
-    rank = np.count_nonzero(valid <= value) - 1
-    denominator = max(1, len(valid) - 1)
+    valid = similarities[
+        np.isfinite(similarities)
+    ]
 
-    return int(round((rank / denominator) * 100))
+    rank = (
+        np.count_nonzero(
+            valid <= value
+        )
+        - 1
+    )
+
+    denominator = max(
+        1,
+        len(valid) - 1
+    )
+
+    return int(
+        round(
+            (rank / denominator) * 100
+        )
+    )
 
 
 def normal_cosine_score(cosine):
-    """
-    Used only for nearest-word information if needed.
-    """
-    return int(round(max(0.0, min(1.0, float(cosine))) * 100))
+    return int(
+        round(
+            max(
+                0.0,
+                min(
+                    1.0,
+                    float(cosine)
+                )
+            )
+            * 100
+        )
+    )
 
 
-def nearest(word_id, limit=8, exclude=()):
-    """
-    Nearest words to the player's current guess.
+# ============================================================
+# NEAREST WORDS
+# ============================================================
 
-    These percentages are cosine similarity percentages for this panel,
-    not the hidden-word game score.
-    """
-    q = np.asarray(vectors[word_id], dtype=np.float32)
-    sims = np.asarray(vectors @ q)
+def nearest(
+    word_id,
+    limit=8,
+    exclude=()
+):
+    q = np.asarray(
+        vectors[word_id],
+        dtype=np.float32
+    )
+
+    sims = np.asarray(
+        vectors @ q
+    )
 
     for idx in exclude:
         sims[int(idx)] = -np.inf
 
-    n = min(limit, len(sims))
+    n = min(
+        limit,
+        len(sims)
+    )
+
     if n <= 0:
         return []
 
-    ids = np.argpartition(sims, -n)[-n:]
-    ids = ids[np.argsort(sims[ids])[::-1]]
+    ids = np.argpartition(
+        sims,
+        -n
+    )[-n:]
+
+    ids = ids[
+        np.argsort(
+            sims[ids]
+        )[::-1]
+    ]
 
     return [
         {
             "word": id_to_word[int(idx)],
-            "score": normal_cosine_score(float(sims[idx]))
+            "score": normal_cosine_score(
+                float(sims[idx])
+            )
         }
         for idx in ids
+        if np.isfinite(sims[idx])
     ]
 
 
+# ============================================================
+# HINT SYSTEM
+# ============================================================
+
 def choose_hint(game):
     """
-    Select one real semantic hint whose DISPLAYED SCORE is also its real
-    WordHeat guess score.
+    Select a real semantic hint.
 
-    Hint progression:
-      - no strong guess: approximately 20 -> 45 -> 70 -> 96
-      - if the player is already at 45: approximately 50 -> 65 -> 81 -> 96
-      - if already at 70: approximately 75 -> 82 -> 89 -> 96
+    Maximum 4 hints.
 
-    The important rule is that we choose the WORD by its actual percentile
-    score first, then return that exact same score. There is no fake score.
+    Target progression:
+        20 -> 45 -> 70 -> 96
+
+    The returned score is the real WordHeat score.
     """
 
-    hint_number = len(game["hints"]) + 1
+    hint_number = (
+        len(game["hints"]) + 1
+    )
+
     if hint_number > 4:
-        raise HTTPException(400, "All 4 hints have already been used.")
+        raise HTTPException(
+            status_code=400,
+            detail="All 4 hints have already been used."
+        )
 
-    similarities = hidden_similarities(game)
+    similarities = hidden_similarities(
+        game
+    )
 
-    # Words already guessed or shown as hints cannot be returned.
+    hidden_id = int(
+        game["hidden_id"]
+    )
+
+    # Words already guessed or hinted.
+    excluded_words = set(
+        game.get(
+            "guessed_words",
+            []
+        )
+    )
+
+    excluded_words.update(
+        game.get(
+            "hints",
+            []
+        )
+    )
+
     excluded_ids = set()
-    for word in game["guessed_words"] | set(game["hints"]):
+
+    for word in excluded_words:
         idx = word_to_id.get(word)
+
         if idx is not None:
-            excluded_ids.add(int(idx))
+            excluded_ids.add(
+                int(idx)
+            )
+
+    excluded_ids.add(
+        hidden_id
+    )
 
     for idx in excluded_ids:
         similarities[idx] = -np.inf
 
-    valid_ids = np.flatnonzero(np.isfinite(similarities))
-    if len(valid_ids) == 0:
-        raise HTTPException(400, "No unused semantic hints are available.")
+    valid_ids = np.flatnonzero(
+        np.isfinite(similarities)
+    )
 
-    # Calculate the player's current actual best score.
+    if len(valid_ids) == 0:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "No unused semantic hints "
+                "are available."
+            )
+        )
+
+    # Current best score.
     best_guess = max(
-        [item["score"] for item in game["history"]],
+        [
+            item["score"]
+            for item in game.get(
+                "history",
+                []
+            )
+        ],
         default=0
     )
 
-    # The target score is a TARGET, not a fake displayed score.
     if best_guess <= 20:
-        targets = [20, 45, 70, 96]
-        target_score = targets[hint_number - 1]
+        targets = [
+            20,
+            45,
+            70,
+            96
+        ]
+
+        target_score = targets[
+            hint_number - 1
+        ]
+
     else:
         if hint_number == 4:
             target_score = 96
+
         else:
-            # Always move above the player's current best and spread toward 96.
             start = best_guess + 5
-            progress = (hint_number - 1) / 3
-            target_score = round(
-                start + (96 - start) * progress
+
+            progress = (
+                (hint_number - 1)
+                / 3
             )
 
-    # Keep hints strictly above the player's current best.
-    target_score = max(target_score, best_guess + 1)
+            target_score = round(
+                start
+                + (96 - start)
+                * progress
+            )
+
+    # Hint should beat current best.
+    target_score = max(
+        target_score,
+        best_guess + 1
+    )
 
     if hint_number == 4:
         target_score = 96
 
-    target_score = min(96, target_score)
+    target_score = min(
+        96,
+        target_score
+    )
 
-    # Fast percentile lookup.
-    #
-    # The old implementation sorted all ~100K words every time Hint was
-    # clicked. That made the hint feel slow. argpartition finds the target
-    # percentile without fully sorting the vocabulary.
-    target_percentile = target_score / 100.0
-    target_pos = int(round(
-        target_percentile * (len(valid_ids) - 1)
-    ))
+    target_percentile = (
+        target_score / 100.0
+    )
 
-    valid_values = similarities[valid_ids]
+    target_pos = int(
+        round(
+            target_percentile
+            * (len(valid_ids) - 1)
+        )
+    )
 
-    # Get a small neighborhood around the desired percentile in O(n)
-    # instead of sorting the complete vocabulary.
-    radius = min(120, max(20, len(valid_ids) // 500))
-    low = max(0, target_pos - radius)
-    high = min(len(valid_ids) - 1, target_pos + radius)
+    valid_values = similarities[
+        valid_ids
+    ]
 
-    # Partition once around the target region.
+    radius = min(
+        120,
+        max(
+            20,
+            len(valid_ids) // 500
+        )
+    )
+
+    low = max(
+        0,
+        target_pos - radius
+    )
+
+    high = min(
+        len(valid_ids) - 1,
+        target_pos + radius
+    )
+
     partitioned_positions = np.argpartition(
         valid_values,
         [low, high]
     )
 
-    candidate_positions = partitioned_positions[low:high + 1]
+    candidate_positions = (
+        partitioned_positions[
+            low:high + 1
+        ]
+    )
 
     best_id = None
     best_distance = float("inf")
 
     for pos in candidate_positions:
-        idx = int(valid_ids[int(pos)])
-        actual = rank_score_fast(similarities, idx)
+        idx = int(
+            valid_ids[int(pos)]
+        )
 
-        # Must be strictly above current best.
+        actual = rank_score_fast(
+            similarities,
+            idx
+        )
+
         if actual <= best_guess:
             continue
 
-        distance = abs(actual - target_score)
+        distance = abs(
+            actual - target_score
+        )
 
         if distance < best_distance:
             best_distance = distance
@@ -316,170 +559,376 @@ def choose_hint(game):
                 break
 
     if best_id is None:
-        # If no word can beat the current score, tell the player honestly.
         raise HTTPException(
-            400,
-            "There is no unused hint above your current score."
+            status_code=400,
+            detail=(
+                "There is no unused hint "
+                "above your current score."
+            )
         )
 
-    actual_score = rank_score(similarities, best_id)
+    actual_score = rank_score(
+        similarities,
+        best_id
+    )
 
     return {
         "word": id_to_word[best_id],
         "score": actual_score,
-        "cosine": round(float(similarities[best_id]), 6),
-        "hint_number": hint_number,
+        "cosine": round(
+            float(
+                similarities[best_id]
+            ),
+            6
+        ),
+        "hint_number": hint_number
     }
 
 
+# ============================================================
+# HEALTH
+# ============================================================
+
 @app.get("/api/health")
 def health():
+    redis_connected = False
+    redis_error = None
+
+    try:
+        redis.set(
+            "wordheat:health",
+            "ok",
+            ex=60
+        )
+
+        value = redis.get(
+            "wordheat:health"
+        )
+
+        if isinstance(value, bytes):
+            value = value.decode(
+                "utf-8"
+            )
+
+        redis_connected = (
+            value == "ok"
+        )
+
+    except Exception as exc:
+        redis_error = (
+            f"{type(exc).__name__}: {exc}"
+        )
+
     return {
-        "status": "ok" if vectors is not None else "error",
-        "version": "5.1",
-        "vectors_loaded": vectors is not None,
+        "status": (
+            "ok"
+            if vectors is not None
+            else "error"
+        ),
+        "version": "6.0",
+        "vectors_loaded": (
+            vectors is not None
+        ),
         "startup_error": startup_error,
         "vector_file_exists": VFILE.exists(),
         "index_file_exists": IFILE.exists(),
-        "vocabulary_size": len(word_to_id),
-        "dimensions": int(vectors.shape[1]) if vectors is not None else 0,
+        "vocabulary_size": len(
+            word_to_id
+        ),
+        "dimensions": (
+            int(vectors.shape[1])
+            if vectors is not None
+            else 0
+        ),
+        "redis_connected": redis_connected,
+        "redis_error": redis_error,
         "endpoints": [
             "/api/game/start",
             "/api/game/guess",
             "/api/game/hint",
-            "/api/game/end",
-        ],
+            "/api/game/end"
+        ]
     }
+
+
+# ============================================================
+# START GAME
+# ============================================================
 
 @app.post("/api/game/start")
 def start(req: StartRequest):
     require_model()
 
-    hidden = clean(req.hidden_word) if req.hidden_word else random.choice(id_to_word)
+    if not id_to_word:
+        raise HTTPException(
+            status_code=503,
+            detail="Vocabulary is empty."
+        )
+
+    if req.hidden_word:
+        hidden = clean(
+            req.hidden_word
+        )
+    else:
+        hidden = random.choice(
+            id_to_word
+        )
 
     if hidden not in word_to_id:
         raise HTTPException(
-            400,
-            "Hidden word is not in the prepared vocabulary."
+            status_code=400,
+            detail=(
+                "Hidden word is not in "
+                "the prepared vocabulary."
+            )
         )
 
     gid = uuid.uuid4().hex
 
-    games[gid] = {
+    game = {
+        "game_id": gid,
         "hidden_word": hidden,
-        "hidden_id": word_to_id[hidden],
+        "hidden_id": int(
+            word_to_id[hidden]
+        ),
         "history": [],
-        "guessed_words": set(),
+        "guessed_words": [],
         "hints": [],
-        "ended": False,
+        "ended": False
     }
 
-    return {"game_id": gid, "backend_version": "5.1"}
+    save_game(
+        gid,
+        game
+    )
 
+    return {
+        "game_id": gid,
+        "backend_version": "6.0"
+    }
+
+
+# ============================================================
+# GUESS
+# ============================================================
 
 @app.post("/api/game/guess")
 def guess(req: GuessRequest):
     require_model()
 
-    game = games.get(req.game_id)
+    game = get_game(
+        req.game_id
+    )
 
-    if not game:
-        raise HTTPException(404, "Game not found.")
     if game["ended"]:
-        raise HTTPException(400, "This game has already ended.")
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "This game has already ended."
+            )
+        )
 
-    word = clean(req.word)
+    word = clean(
+        req.word
+    )
 
     if word not in word_to_id:
         raise HTTPException(
-            400,
-            "That word is not in the WordHeat vocabulary."
+            status_code=400,
+            detail=(
+                "That word is not in "
+                "the WordHeat vocabulary."
+            )
         )
 
-    word_id = word_to_id[word]
+    word_id = int(
+        word_to_id[word]
+    )
 
-    # IMPORTANT:
-    # Use the exact same score function used to select hints.
-    similarities = hidden_similarities(game)
-    current_score = rank_score_fast(similarities, word_id)
+    similarities = hidden_similarities(
+        game
+    )
+
+    current_score = rank_score_fast(
+        similarities,
+        word_id
+    )
 
     item = {
         "word": word,
         "score": current_score,
-        "cosine": round(float(similarities[word_id]), 6),
+        "cosine": round(
+            float(
+                similarities[word_id]
+            ),
+            6
+        )
     }
 
-    # Repeated guesses remain allowed.
-    game["history"].append(item)
-    game["guessed_words"].add(word)
+    game.setdefault(
+        "history",
+        []
+    ).append(
+        item
+    )
+
+    game.setdefault(
+        "guessed_words",
+        []
+    )
+
+    if word not in game["guessed_words"]:
+        game["guessed_words"].append(
+            word
+        )
+
+    won = (
+        word == game["hidden_word"]
+    )
+
+    if won:
+        game["ended"] = True
+
+    save_game(
+        req.game_id,
+        game
+    )
+
+    exclude_ids = [
+        word_to_id[w]
+        for w in game.get(
+            "guessed_words",
+            []
+        )
+        if w in word_to_id
+    ]
+
+    exclude_ids.append(
+        game["hidden_id"]
+    )
+
+    nearest_words = nearest(
+        word_id,
+        8,
+        exclude_ids
+    )
 
     return {
         "guess": word,
         "score": current_score,
         "cosine": item["cosine"],
-        "won": word == game["hidden_word"],
-        "nearest_words": nearest(
-            word_id,
-            8,
-            (word_id, game["hidden_id"])
-        ),
-        "history": game["history"],
+        "won": won,
+        "nearest_words": nearest_words,
+        "history": game["history"]
     }
 
+
+# ============================================================
+# HINT
+# ============================================================
 
 @app.post("/api/game/hint")
 def hint(req: HintRequest):
     require_model()
 
-    game = games.get(req.game_id)
+    game = get_game(
+        req.game_id
+    )
 
-    if not game:
-        raise HTTPException(404, "Game not found.")
     if game["ended"]:
-        raise HTTPException(400, "This game has already ended.")
-
-    if len(game["hints"]) >= 4:
         raise HTTPException(
-            400,
-            "All 4 hints have already been used."
+            status_code=400,
+            detail=(
+                "This game has already ended."
+            )
         )
 
-    item = choose_hint(game)
+    if len(
+        game.get(
+            "hints",
+            []
+        )
+    ) >= 4:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "All 4 hints have already been used."
+            )
+        )
 
-    game["hints"].append(item["word"])
+    item = choose_hint(
+        game
+    )
+
+    game.setdefault(
+        "hints",
+        []
+    ).append(
+        item["word"]
+    )
+
+    save_game(
+        req.game_id,
+        game
+    )
 
     return {
         "hint": item,
-        "hint_number": len(game["hints"]),
-        "max_hints": 4,
+        "hint_number": len(
+            game["hints"]
+        ),
+        "max_hints": 4
     }
 
 
+# ============================================================
+# END GAME
+# ============================================================
+
 @app.post("/api/game/end")
 def end_game(req: EndRequest):
-    game = games.get(req.game_id)
-
-    if not game:
-        raise HTTPException(404, "Game not found.")
+    game = get_game(
+        req.game_id
+    )
 
     game["ended"] = True
+
+    save_game(
+        req.game_id,
+        game
+    )
 
     return {
         "ended": True,
         "answer": game["hidden_word"],
-        "history": game["history"],
+        "history": game["history"]
     }
 
 
+# ============================================================
+# GET GAME STATE
+# ============================================================
+
 @app.get("/api/game/{game_id}")
 def game_state(game_id: str):
-    game = games.get(game_id)
-
-    if not game:
-        raise HTTPException(404, "Game not found.")
+    game = get_game(
+        game_id
+    )
 
     return {
         "game_id": game_id,
-        "history": game["history"],
-        "hints_used": len(game["hints"]),
+        "history": game.get(
+            "history",
+            []
+        ),
+        "hints_used": len(
+            game.get(
+                "hints",
+                []
+            )
+        ),
+        "ended": game.get(
+            "ended",
+            False
+        )
     }
